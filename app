@@ -136,6 +136,13 @@ int getRingBufferIndex(int baseIndex, int offset) {
   return (baseIndex + offset + totalSamples) % totalSamples;
 }
 
+// 最新インデックスの取得
+void getLatestIndices(int& latestSampleIdx, int& latestAvgIdx) {
+  latestSampleIdx = getRingBufferIndex(currentSample, -1);
+  int latestAvgBaseIndex = (currentSample > 0) ? ((currentSample - 1) / samplesPerAvg) : -1;
+  latestAvgIdx = (latestAvgBaseIndex >= 0) ? (latestAvgBaseIndex % (totalHours * 6)) : -1;
+}
+
 // 電圧データをサンプリングして保存
 void sampleVoltages() {
   time_t now;
@@ -208,11 +215,16 @@ fetchData();setInterval(fetchData,%d);</script></body></html>
 void handleRoot() {
   char html[2048];
   char table[512] = "";
+  int latestSampleIdx, latestAvgIdx;
+  getLatestIndices(latestSampleIdx, latestAvgIdx);
   for (int ch = 0; ch < 4; ch++) {
-    float latest = voltageData[getRingBufferIndex(currentSample, -1)].voltage[ch];
-    float avg10min = avgVoltage[((currentSample + 1) / samplesPerAvg - 1 + totalHours * 6) % (totalHours * 6)].voltage[ch];
+    float latest = (currentSample > 0) ? voltageData[latestSampleIdx].voltage[ch] : 0.0;
+    float avg10min = (latestAvgIdx != -1) ? avgVoltage[latestAvgIdx].voltage[ch] : 0.0;
     char row[128];
-    snprintf(row, sizeof(row), "<tr><td>V%d</td><td>%.2f</td><td>%.2f</td></tr>", ch + 1, latest, avg10min);
+    snprintf(row, sizeof(row), "<tr><td>V%d</td><td>%s</td><td>%s</td></tr>", 
+             ch + 1, 
+             (currentSample > 0) ? String(latest, 2).c_str() : "データなし",
+             (latestAvgIdx != -1) ? String(avg10min, 2).c_str() : "データなし");
     strncat(table, row, sizeof(table) - strlen(table) - 1);
   }
   snprintf(html, sizeof(html), htmlTemplate, getFormattedTime().c_str(), table, pathCsv, graphDataPoints, pathData, refreshIntervalMs);
@@ -223,12 +235,14 @@ void handleRoot() {
 void handleData() {
   char json[1024];
   strcpy(json, "[");
+  int latestSampleIdx, latestAvgIdx;
+  getLatestIndices(latestSampleIdx, latestAvgIdx);
   for (int ch = 0; ch < 4; ch++) {
     strcat(json, "[");
     for (int i = 0; i < graphDataPoints; i++) {
       int index = getRingBufferIndex(currentSample, -graphDataPoints + i);
       char val[16];
-      snprintf(val, sizeof(val), "%.2f", voltageData[index].voltage[ch]);
+      snprintf(val, sizeof(val), "%.2f", (currentSample > 0) ? voltageData[index].voltage[ch] : 0.0);
       strcat(json, val);
       if (i < graphDataPoints - 1) strcat(json, ",");
     }
