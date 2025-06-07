@@ -1,0 +1,54 @@
+// Google Apps Script コード
+
+// このスクリプトがデータを書き込むスプレッドシートのIDを指定してください
+// スプレッドシートのURLから取得できます (例: https://docs.google.com/spreadsheets/d/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/edit#gid=0 の 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' の部分)
+const SPREADSHEET_ID = "YOUR_SPREADSHEET_ID_HERE"; // <<< ここをあなたのスプレッドシートIDに置き換えてください
+
+// ESP32からの簡易認証用シークレットキー。ESP32のコードと一致させてください
+const EXPECTED_SECRET_KEY = "your_secret_key"; // <<< ESP32の GOOGLE_SHEET_API_SECRET と同じ値を設定
+
+/**
+ * HTTP POSTリクエストを処理する関数
+ * ESP32がこのWebアプリにデータを送信すると、この関数が実行されます。
+ * @param {object} e イベントオブジェクト (HTTP POSTリクエストの情報を含む)
+ */
+function doPost(e) {
+  // 簡易認証: URLパラメータからシークレットキーを取得し、検証
+  const secretKey = e.parameter.secret;
+  if (!secretKey || secretKey !== EXPECTED_SECRET_KEY) {
+    return ContentService.createTextOutput("Authentication Failed").setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  try {
+    // リクエストボディからJSONデータを取得
+    const jsonString = e.postData.contents;
+    const data = JSON.parse(jsonString);
+
+    // デバッグログ (スクリプトエディタの「実行ログ」で確認できます)
+    Logger.log("Received data: " + JSON.stringify(data));
+
+    // スプレッドシートを開く
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getActiveSheet();
+
+    // タイムスタンプを読み取り可能な日付形式に変換
+    const timestampUnix = data.timestamp;
+    const date = new Date(timestampUnix * 1000); // JavaScriptのDateはミリ秒単位なので1000を乗算
+
+    // スプレッドシートに新しい行を追加
+    sheet.appendRow([
+      date.toLocaleString(), // 日付と時刻
+      data.v1,
+      data.v2,
+      data.v3,
+      data.v4
+    ]);
+
+    // 成功レスポンスを返す
+    return ContentService.createTextOutput("Data logged successfully").setMimeType(ContentService.MimeType.TEXT);
+
+  } catch (error) {
+    // エラー処理
+    Logger.log("Error: " + error.toString());
+    return ContentService.createTextOutput("Error logging data: " + error.toString()).setMimeType(ContentService.MimeType.TEXT);
+  }
+}
