@@ -2,7 +2,8 @@
 #include <WebServer.h>
 #include <time.h>
 #include <esp_sleep.h>
-#include <HTTPClient.h> // HTTPリクエスト用に新しく追加
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 // デバッグ設定
 #define DEBUG_ENABLED true
@@ -26,30 +27,33 @@ struct SampleData {
   uint16_t voltage[4]; // 電圧を0.01V単位で保存（例: 5.23V → 523）
   time_t timestamp;
 };
+
 struct AvgData {
   uint16_t voltage[4]; // 平均電圧も0.01V単位
   time_t timestamp;
 };
+
 SampleData voltageData[totalSamples];
 AvgData avgVoltage[totalHours * 6]; // 6 averages per hour
 int currentSample = 0;
 
 // WebサーバーとWiFi設定
 WebServer server(80);
-const char* ssid = "YOUR_WIFI_SSID";     // ご自身のWiFi SSIDに置き換えてください
+const char* ssid = "YOUR_WIFI_SSID";         // ご自身のWiFi SSIDに置き換えてください
 const char* password = "YOUR_WIFI_PASSWORD"; // ご自身のWiFi パスワードに置き換えてください
 // 注意: Google Sheetsへのアップロードにはインターネット接続が必要です。
 // このWiFiネットワークがインターネットに接続できることを確認してください。
-
 const char* pathRoot = "/";
 const char* pathData = "/data";
 const char* pathCsv = "/csv";
 
 // Google Apps Script WebアプリのURL
 // !!! ここにデプロイしたGoogle Apps ScriptのURLを貼り付けてください !!!
-// 例: const char* GOOGLE_SHEET_API_URL = "https://script.google.com/macros/s/AKfycbzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/exec?secret=YOUR_SECRET_KEY";
-const char* GOOGLE_SHEET_API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; // WebアプリのURL
+// 例: const char* GOOGLE_SHEET_API_URL = "https://script.google.com/macros/s/AKfycbzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/exec";
+const char* GOOGLE_SHEET_API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL";
 const char* GOOGLE_SHEET_API_SECRET = "your_secret_key"; // 簡単な認証用。Apps Script側で確認します。
+// 認証はURLクエリではなくHTTPヘッダー(X-Api-Secret)で送る。
+// GASの doPost(e) 側では e.parameter ではなく、リクエストヘッダーを確認する実装に変更が必要。
 
 // ADC設定
 const float VOLTAGE_DIVIDER_RATIO = (100.0 + 15.0) / 15.0;
@@ -65,6 +69,18 @@ unsigned long wifiConnectStartTime = 0;
 const unsigned long wifiConnectTimeout = 30000; // WiFi接続タイムアウト（ms）
 bool wifiConnecting = false;
 
+// ---- Google Sheetsアップロード用の非同期キュー ----
+// loop()をブロックしないよう、送信は別タスク(別コア)に任せる。
+// 保持は直近1件のみ（フル履歴の再送キューではない）。
+// 送信中に新しい平均が確定した場合は最新値で上書きする。
+struct PendingUpload {
+  AvgData data;
+  bool valid;
+};
+PendingUpload pendingUpload = {{}, false};
+SemaphoreHandle_t uploadMutex = nullptr;
+TaskHandle_t uploadTaskHandle = nullptr;
+
 // 関数プロトタイプ宣言
 void connectToWiFi();
 void setupWebServer();
@@ -76,10 +92,13 @@ void handleRoot();
 void handleData();
 void handleCsv();
 String getFormattedTime();
-void sendDataToGoogleSheet(const AvgData& data); // 新しく追加
+bool doSendToGoogleSheet(const AvgData& data);
+void uploadTask(void* param);
+void enqueueUpload(const AvgData& data);
 
 void setup() {
   Serial.begin(115200);
+
   // ピンの初期化
   for (int i = 0; i < 4; i++) {
     pinMode(adcPins[i], INPUT);
@@ -102,10 +121,10 @@ void setup() {
 
   connectToWiFi();
   setupWebServer();
+
   // NTPサーバーから時刻同期
   configTime(9 * 3600, 0, "ntp.nict.jp", "pool.ntp.org"); // 日本標準時
   if (DEBUG_ENABLED) Serial.println("NTPサーバーと時刻同期中...");
-  time_t now = 0;
   struct tm timeinfo;
   int retry = 0;
   while (!getLocalTime(&timeinfo) && retry < 10) {
@@ -114,19 +133,26 @@ void setup() {
     retry++;
   }
   if (DEBUG_ENABLED) Serial.println(getFormattedTime());
+
+  // CPUを完全停止させるlight sleepの代わりにモデムスリープを使う。
+  // CPUは常時稼働のままWebサーバーは即応可能で、WiFi受信動作のみを間欠化する。
+  WiFi.setSleep(true);
+
+  // Google Sheetsアップロード用タスクを起動。
+  // WiFiスタックと同じcore0で動かす（core1はloop()が占有するため）。
+  uploadMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(uploadTask, "uploadTask", 8192, nullptr, 1, &uploadTaskHandle, 0);
 }
 
 void loop() {
   static unsigned long lastSample = 0;
-  // サンプリング
+
+  // サンプリング（light sleepでCPUを止めない）
   if (millis() - lastSample >= sampleIntervalSec * 1000) {
     sampleVoltages();
     lastSample = millis();
     digitalWrite(greenLED, HIGH); // サンプリング成功時に緑LED点灯
     greenLedOnTime = millis();
-    // ライトスリープ（WiFiとメモリを保持）
-    esp_sleep_enable_timer_wakeup(sampleIntervalSec * 1000000ULL);
-    esp_light_sleep_start();
   }
 
   // 緑LEDの点滅制御
@@ -151,12 +177,12 @@ void loop() {
     wifiConnecting = false;
   }
 
-  // WiFi接続チェック（ライトスリープ復帰後）
+  // WiFi接続チェック
   if (!wifiConnecting && WiFi.status() != WL_CONNECTED) {
     connectToWiFi();
   }
 
-  server.handleClient();
+  server.handleClient(); // 毎ループ確実に処理されるため即応性が確保される
 }
 
 // 複数回サンプリングして平均値を計算
@@ -182,6 +208,7 @@ void getLatestIndices(int& latestSampleIdx, int& latestAvgIdx) {
 void sampleVoltages() {
   time_t now;
   time(&now);
+
   for (int ch = 0; ch < 4; ch++) {
     float voltage = readAverageVoltage(adcPins[ch]);
     voltageData[currentSample].voltage[ch] = (uint16_t)(voltage * VOLTAGE_SCALE); // 0.01V単位
@@ -198,14 +225,14 @@ void sampleVoltages() {
         sum[ch] += voltageData[idx].voltage[ch] / VOLTAGE_SCALE;
       }
     }
-    // 平均値をAvgData構造体に保存
     for (int ch = 0; ch < 4; ch++) {
       avgVoltage[avgIndex % (totalHours * 6)].voltage[ch] = (uint16_t)((sum[ch] / samplesPerAvg) * VOLTAGE_SCALE);
     }
     avgVoltage[avgIndex % (totalHours * 6)].timestamp = now;
 
-    // !!! 新しく追加: 平均データが計算されたらGoogle Sheetsに送信 !!!
-    sendDataToGoogleSheet(avgVoltage[avgIndex % (totalHours * 6)]);
+    // Google Sheetsへの送信は直接呼ばずキューに積むだけ。
+    // loop()は一切ブロックされない。
+    enqueueUpload(avgVoltage[avgIndex % (totalHours * 6)]);
   }
 
   currentSample = (currentSample + 1) % totalSamples;
@@ -253,79 +280,123 @@ fetchData();setInterval(fetchData,%d);</script></body></html>
 
 // ルートエンドポイント
 void handleRoot() {
-  char html[1024]; // バッファサイズ縮小
-  char table[512] = "";
+  static char html[1024];
+  static char table[512];
+  table[0] = '\0';
+
   int latestSampleIdx, latestAvgIdx;
   getLatestIndices(latestSampleIdx, latestAvgIdx);
+
+  int tableOffset = 0;
   for (int ch = 0; ch < 4; ch++) {
     float latest = (currentSample > 0) ? (voltageData[latestSampleIdx].voltage[ch] / VOLTAGE_SCALE) : 0.0;
     float avg10min = (latestAvgIdx != -1) ? (avgVoltage[latestAvgIdx].voltage[ch] / VOLTAGE_SCALE) : 0.0;
-    char row[128];
-    snprintf(row, sizeof(row), "<tr><td>V%d</td><td>%s</td><td>%s</td></tr>", 
-             ch + 1, 
-             (currentSample > 0) ? String(latest, 2).c_str() : "データなし",
-             (latestAvgIdx != -1) ? String(avg10min, 2).c_str() : "データなし");
-    strncat(table, row, sizeof(table) - strlen(table) - 1);
+
+    char latestStr[16];
+    char avgStr[16];
+    snprintf(latestStr, sizeof(latestStr), "%.2f", latest);
+    snprintf(avgStr, sizeof(avgStr), "%.2f", avg10min);
+
+    tableOffset += snprintf(table + tableOffset, sizeof(table) - tableOffset,
+                             "<tr><td>V%d</td><td>%s</td><td>%s</td></tr>",
+                             ch + 1,
+                             (currentSample > 0) ? latestStr : "データなし",
+                             (latestAvgIdx != -1) ? avgStr : "データなし");
+    if (tableOffset >= (int)sizeof(table)) {
+      tableOffset = sizeof(table) - 1; // snprintfの戻り値が超過した場合のクランプ
+      break;
+    }
   }
-  snprintf(html, sizeof(html), htmlTemplate, getFormattedTime().c_str(), table, pathCsv, graphDataPoints, pathData, refreshIntervalMs);
+
+  snprintf(html, sizeof(html), htmlTemplate, getFormattedTime().c_str(), table, pathCsv,
+           graphDataPoints, pathData, refreshIntervalMs);
   server.send(200, "text/html", html);
 }
 
 // データエンドポイント（JSON）
 void handleData() {
-  char json[512]; // バッファサイズ縮小
-  strcpy(json, "[");
+  static char json[1024]; // 4ch x 30点 x 最大7バイト ≈ 840バイトに対し余裕を持たせる
+  int offset = 0;
+
+  offset += snprintf(json + offset, sizeof(json) - offset, "[");
+
   int latestSampleIdx, latestAvgIdx;
   getLatestIndices(latestSampleIdx, latestAvgIdx);
-  for (int ch = 0; ch < 4; ch++) {
-    strcat(json, "[");
-    for (int i = 0; i < graphDataPoints; i++) {
+
+  for (int ch = 0; ch < 4 && offset < (int)sizeof(json); ch++) {
+    offset += snprintf(json + offset, sizeof(json) - offset, "[");
+    for (int i = 0; i < graphDataPoints && offset < (int)sizeof(json); i++) {
       int index = getRingBufferIndex(currentSample, -graphDataPoints + i);
-      char val[16];
-      snprintf(val, sizeof(val), "%.2f", (currentSample > 0) ? (voltageData[index].voltage[ch] / VOLTAGE_SCALE) : 0.0);
-      strcat(json, val);
-      if (i < graphDataPoints - 1) strcat(json, ",");
+      float v = (currentSample > 0) ? (voltageData[index].voltage[ch] / VOLTAGE_SCALE) : 0.0;
+      offset += snprintf(json + offset, sizeof(json) - offset, "%.2f%s",
+                          v, (i < graphDataPoints - 1) ? "," : "");
     }
-    strcat(json, "]");
-    if (ch < 3) strcat(json, ",");
+    offset += snprintf(json + offset, sizeof(json) - offset, "]%s", (ch < 3) ? "," : "");
   }
-  strcat(json, "]");
+  if (offset < (int)sizeof(json)) {
+    snprintf(json + offset, sizeof(json) - offset, "");
+  }
+  if (offset >= (int)sizeof(json)) {
+    offset = sizeof(json) - 1; // snprintfの戻り値クランプ（バッファ超過時の安全策）
+  }
+
   server.send(200, "application/json", json);
 }
 
-// CSVエンドポイント（チャンク転送）
+// CSVエンドポイント（バッファに溜めてまとめて送信）
 void handleCsv() {
   server.sendHeader("Content-Type", "text/csv");
   server.send(200);
   WiFiClient client = server.client();
-  client.print("Timestamp,V1,V2,V3,V4\n");
+
+  static char buf[1024];
+  int offset = 0;
+  const int flushThreshold = sizeof(buf) - 128; // 1行分（最大128バイト想定）の余裕を残す
+
+  offset += snprintf(buf + offset, sizeof(buf) - offset, "Timestamp,V1,V2,V3,V4\n");
+
   for (int i = 0; i < totalSamples; i++) {
-    char row[128];
-    snprintf(row, sizeof(row), "%lld,%.2f,%.2f,%.2f,%.2f\n",
-             (long long)voltageData[i].timestamp,
-             voltageData[i].voltage[0] / VOLTAGE_SCALE,
-             voltageData[i].voltage[1] / VOLTAGE_SCALE,
-             voltageData[i].voltage[2] / VOLTAGE_SCALE,
-             voltageData[i].voltage[3] / VOLTAGE_SCALE);
-    client.print(row);
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                        "%lld,%.2f,%.2f,%.2f,%.2f\n",
+                        (long long)voltageData[i].timestamp,
+                        voltageData[i].voltage[0] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[1] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[2] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[3] / VOLTAGE_SCALE);
+    if (offset >= flushThreshold) {
+      client.write((const uint8_t*)buf, offset);
+      offset = 0;
+    }
   }
-  client.print("\n10min Averages\nTimestamp,V1,V2,V3,V4\n");
+  if (offset > 0) {
+    client.write((const uint8_t*)buf, offset);
+    offset = 0;
+  }
+
+  offset += snprintf(buf + offset, sizeof(buf) - offset, "\n10min Averages\nTimestamp,V1,V2,V3,V4\n");
+
   for (int i = 0; i < totalHours * 6; i++) {
-    char row[128];
-    snprintf(row, sizeof(row), "%lld,%.2f,%.2f,%.2f,%.2f\n",
-             (long long)avgVoltage[i].timestamp,
-             avgVoltage[i].voltage[0] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[1] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[2] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[3] / VOLTAGE_SCALE);
-    client.print(row);
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                        "%lld,%.2f,%.2f,%.2f,%.2f\n",
+                        (long long)avgVoltage[i].timestamp,
+                        avgVoltage[i].voltage[0] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[1] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[2] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[3] / VOLTAGE_SCALE);
+    if (offset >= flushThreshold) {
+      client.write((const uint8_t*)buf, offset);
+      offset = 0;
+    }
   }
+  if (offset > 0) {
+    client.write((const uint8_t*)buf, offset);
+  }
+
   client.stop();
 }
 
 // 時刻取得（エラーハンドリング付き）
 String getFormattedTime() {
-  time_t now;
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     return "時刻同期失敗";
@@ -335,45 +406,99 @@ String getFormattedTime() {
   return String(buf);
 }
 
-// 新しく追加された関数: Google Sheetsへデータを送信
-void sendDataToGoogleSheet(const AvgData& data) {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (DEBUG_ENABLED) Serial.println("WiFiが接続されていません。Google Sheetsへの送信をスキップします。");
-    return;
+// ---- Google Sheetsアップロード（非同期） ----
+
+// メインloop()側から呼ぶ。ミューテックスで保護しつつ最新値で上書きする。
+// 送信中に次の平均が確定した場合は古い方は破棄され最新のみ送信される
+// （全履歴を漏れなく送るキューではないことに注意）。
+void enqueueUpload(const AvgData& data) {
+  if (uploadMutex == nullptr) return;
+  if (xSemaphoreTake(uploadMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    pendingUpload.data = data;
+    pendingUpload.valid = true;
+    xSemaphoreGive(uploadMutex);
   }
+}
+
+// 実際のHTTP送信。ブロッキングだが、これはuploadTask内(別コア)で実行されるため
+// loop()やWebサーバーの応答性には影響しない。
+bool doSendToGoogleSheet(const AvgData& data) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure(); // 簡易実装。本番運用ではCA証明書を設定して検証すること
 
   HTTPClient http;
-  char payload[256]; // JSONペイロードのバッファ
+  http.setTimeout(4000); // 4秒でタイムアウト。無応答時に無限に張り付かないための上限
 
-  // JSONデータの構築
-  // ArduinoJsonライブラリを使うとより堅牢ですが、ここでは手動で構築します
-  snprintf(payload, sizeof(payload), 
-           "{\"timestamp\":%ld,\"v1\":%.2f,\"v2\":%.2f,\"v3\":%.2f,\"v4\":%.2f}",
-           data.timestamp,
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"timestamp\":%lld,\"v1\":%.2f,\"v2\":%.2f,\"v3\":%.2f,\"v4\":%.2f}",
+           (long long)data.timestamp,
            data.voltage[0] / VOLTAGE_SCALE,
            data.voltage[1] / VOLTAGE_SCALE,
            data.voltage[2] / VOLTAGE_SCALE,
            data.voltage[3] / VOLTAGE_SCALE);
 
-  // URLにシークレットキーを追加して簡易認証
-  String url = String(GOOGLE_SHEET_API_URL) + "?secret=" + GOOGLE_SHEET_API_SECRET;
+  if (!http.begin(secureClient, GOOGLE_SHEET_API_URL)) {
+    if (DEBUG_ENABLED) Serial.println("HTTPClient beginに失敗しました");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Api-Secret", GOOGLE_SHEET_API_SECRET); // シークレットはヘッダーで送る（URLクエリに含めない）
 
-  if (DEBUG_ENABLED) Serial.printf("Google Sheetsへデータを送信中: %s\n", url.c_str());
+  if (DEBUG_ENABLED) Serial.printf("Google Sheetsへデータを送信中: %s\n", GOOGLE_SHEET_API_URL);
   if (DEBUG_ENABLED) Serial.printf("ペイロード: %s\n", payload);
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
   int httpResponseCode = http.POST(payload);
+  bool ok = (httpResponseCode > 0 && httpResponseCode < 300);
 
-  if (httpResponseCode > 0) {
-    if (DEBUG_ENABLED) {
+  if (DEBUG_ENABLED) {
+    if (httpResponseCode > 0) {
       Serial.printf("Google SheetsへのHTTPレスポンスコード: %d\n", httpResponseCode);
       String response = http.getString();
       Serial.println(response);
+    } else {
+      Serial.printf("Google SheetsへのHTTPリクエスト失敗: %s\n", http.errorToString(httpResponseCode).c_str());
     }
-  } else {
-    if (DEBUG_ENABLED) Serial.printf("Google SheetsへのHTTPリクエスト失敗: %s\n", http.errorToString(httpResponseCode).c_str());
   }
+
   http.end();
+  return ok;
+}
+
+// 別コア(core0)で常駐し、キューに積まれたデータを送信し続けるタスク。
+void uploadTask(void* param) {
+  for (;;) {
+    AvgData localData;
+    bool hasData = false;
+
+    if (xSemaphoreTake(uploadMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (pendingUpload.valid) {
+        localData = pendingUpload.data;
+        hasData = true;
+        pendingUpload.valid = false; // 楽観的にクリア。失敗時は下で復元する
+      }
+      xSemaphoreGive(uploadMutex);
+    }
+
+    if (hasData) {
+      bool ok = doSendToGoogleSheet(localData);
+      if (!ok) {
+        // 失敗時は再送のため戻す。ただしその間に新しいデータが積まれていれば
+        // そちらを優先し、古いデータは破棄する（直近1件保持のポリシー）。
+        if (xSemaphoreTake(uploadMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          if (!pendingUpload.valid) {
+            pendingUpload.data = localData;
+            pendingUpload.valid = true;
+          }
+          xSemaphoreGive(uploadMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000)); // 失敗時は5秒待って再試行（連続失敗の高頻度リトライを防ぐ）
+        continue;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000)); // キュー確認間隔
+  }
 }
