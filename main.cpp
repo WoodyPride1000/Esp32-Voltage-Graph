@@ -8,34 +8,36 @@
 
 // ADCピンとLEDピンの定義
 const int adcPins[4] = {34, 35, 32, 33}; // V1〜V4
-const int greenLED = 2;                   // 正常動作（サンプリング）用
-const int redLED = 4;                     // エラー（WiFi接続失敗など）用
+const int greenLED = 2; // 正常動作（サンプリング）用
+const int redLED = 4;   // エラー（WiFi接続失敗など）用
 
 // サンプリングと平均化の設定
-const int sampleIntervalSec = 10;        // 10秒ごとにサンプリング
-const int averageIntervalMin = 10;       // 10分ごとの平均
-const int totalHours = 6;                // 6時間分のデータ（メモリ節約）
+const int sampleIntervalSec = 10;   // 10秒ごとにサンプリング
+const int averageIntervalMin = 10;  // 10分ごとの平均
+const int totalHours = 6;           // 6時間分のデータ（メモリ節約）
 const int samplesPerAvg = averageIntervalMin * 60 / sampleIntervalSec; // 60サンプル/10分
-const int totalSamples = totalHours * 60 * 60 / sampleIntervalSec;    // 2160サンプル
-const int graphDataPoints = 30;           // グラフに表示するデータ数
-const int refreshIntervalMs = 60000;      // データ更新間隔（60秒）
+const int totalSamples = totalHours * 60 * 60 / sampleIntervalSec;     // 2160サンプル
+const int graphDataPoints = 30;     // グラフに表示するデータ数
+const int refreshIntervalMs = 60000; // データ更新間隔（60秒）
 
 // データ構造
 struct SampleData {
   uint16_t voltage[4]; // 電圧を0.01V単位で保存（例: 5.23V → 523）
   time_t timestamp;
 };
+
 struct AvgData {
   uint16_t voltage[4]; // 平均電圧も0.01V単位
   time_t timestamp;
 };
+
 SampleData voltageData[totalSamples];
 AvgData avgVoltage[totalHours * 6]; // 6 averages per hour
 int currentSample = 0;
 
 // WebサーバーとWiFi設定
 WebServer server(80);
-const char* ssid = "TestWiFi";     // テスト用SSID
+const char* ssid = "TestWiFi";       // テスト用SSID
 const char* password = "TestPass123"; // テスト用パスワード
 const char* pathRoot = "/";
 const char* pathData = "/data";
@@ -57,6 +59,7 @@ bool wifiConnecting = false;
 
 void setup() {
   Serial.begin(115200);
+
   // ピンの初期化
   for (int i = 0; i < 4; i++) {
     pinMode(adcPins[i], INPUT);
@@ -80,19 +83,22 @@ void setup() {
   connectToWiFi();
   setupWebServer();
   configTime(9 * 3600, 0, "ntp.nict.jp", "pool.ntp.org"); // 日本標準時
+
+  // CPUを完全停止させるlight sleepの代わりにモデムスリープを使う。
+  // CPUは常時稼働のままWiFiの受信間欠動作だけで消費電力を抑える。
+  // これによりWebサーバーがサンプリング周期中も常時応答可能になる。
+  WiFi.setSleep(true);
 }
 
 void loop() {
   static unsigned long lastSample = 0;
-  // サンプリング
+
+  // サンプリング（light sleepでCPUを止めない）
   if (millis() - lastSample >= sampleIntervalSec * 1000) {
     sampleVoltages();
     lastSample = millis();
     digitalWrite(greenLED, HIGH); // サンプリング成功時に緑LED点灯
     greenLedOnTime = millis();
-    // ライトスリープ（WiFiとメモリを保持）
-    esp_sleep_enable_timer_wakeup(sampleIntervalSec * 1000000ULL);
-    esp_light_sleep_start();
   }
 
   // 緑LEDの点滅制御
@@ -117,12 +123,12 @@ void loop() {
     wifiConnecting = false;
   }
 
-  // WiFi接続チェック（ライトスリープ復帰後）
+  // WiFi接続チェック
   if (!wifiConnecting && WiFi.status() != WL_CONNECTED) {
     connectToWiFi();
   }
 
-  server.handleClient();
+  server.handleClient(); // 毎ループ確実に処理されるため即応性が確保される
 }
 
 // 複数回サンプリングして平均値を計算
@@ -148,6 +154,7 @@ void getLatestIndices(int& latestSampleIdx, int& latestAvgIdx) {
 void sampleVoltages() {
   time_t now;
   time(&now);
+
   for (int ch = 0; ch < 4; ch++) {
     float voltage = readAverageVoltage(adcPins[ch]);
     voltageData[currentSample].voltage[ch] = (uint16_t)(voltage * VOLTAGE_SCALE); // 0.01V単位
@@ -215,79 +222,123 @@ fetchData();setInterval(fetchData,%d);</script></body></html>
 
 // ルートエンドポイント
 void handleRoot() {
-  char html[1024]; // バッファサイズ縮小
-  char table[512] = "";
+  static char html[1024];
+  static char table[512];
+  table[0] = '\0';
+
   int latestSampleIdx, latestAvgIdx;
   getLatestIndices(latestSampleIdx, latestAvgIdx);
+
+  int tableOffset = 0;
   for (int ch = 0; ch < 4; ch++) {
     float latest = (currentSample > 0) ? (voltageData[latestSampleIdx].voltage[ch] / VOLTAGE_SCALE) : 0.0;
     float avg10min = (latestAvgIdx != -1) ? (avgVoltage[latestAvgIdx].voltage[ch] / VOLTAGE_SCALE) : 0.0;
-    char row[128];
-    snprintf(row, sizeof(row), "<tr><td>V%d</td><td>%s</td><td>%s</td></tr>", 
-             ch + 1, 
-             (currentSample > 0) ? String(latest, 2).c_str() : "データなし",
-             (latestAvgIdx != -1) ? String(avg10min, 2).c_str() : "データなし");
-    strncat(table, row, sizeof(table) - strlen(table) - 1);
+
+    char latestStr[16];
+    char avgStr[16];
+    snprintf(latestStr, sizeof(latestStr), "%.2f", latest);
+    snprintf(avgStr, sizeof(avgStr), "%.2f", avg10min);
+
+    tableOffset += snprintf(table + tableOffset, sizeof(table) - tableOffset,
+                             "<tr><td>V%d</td><td>%s</td><td>%s</td></tr>",
+                             ch + 1,
+                             (currentSample > 0) ? latestStr : "データなし",
+                             (latestAvgIdx != -1) ? avgStr : "データなし");
+    if (tableOffset >= (int)sizeof(table)) {
+      tableOffset = sizeof(table) - 1; // snprintfの戻り値が超過した場合のクランプ
+      break;
+    }
   }
-  snprintf(html, sizeof(html), htmlTemplate, getFormattedTime().c_str(), table, pathCsv, graphDataPoints, pathData, refreshIntervalMs);
+
+  snprintf(html, sizeof(html), htmlTemplate, getFormattedTime().c_str(), table, pathCsv,
+           graphDataPoints, pathData, refreshIntervalMs);
   server.send(200, "text/html", html);
 }
 
 // データエンドポイント（JSON）
 void handleData() {
-  char json[512]; // バッファサイズ縮小
-  strcpy(json, "[");
+  static char json[1024]; // 4ch x 30点 x 最大7バイト ≈ 840バイトに対し余裕を持たせる
+  int offset = 0;
+
+  offset += snprintf(json + offset, sizeof(json) - offset, "[");
+
   int latestSampleIdx, latestAvgIdx;
   getLatestIndices(latestSampleIdx, latestAvgIdx);
-  for (int ch = 0; ch < 4; ch++) {
-    strcat(json, "[");
-    for (int i = 0; i < graphDataPoints; i++) {
+
+  for (int ch = 0; ch < 4 && offset < (int)sizeof(json); ch++) {
+    offset += snprintf(json + offset, sizeof(json) - offset, "[");
+    for (int i = 0; i < graphDataPoints && offset < (int)sizeof(json); i++) {
       int index = getRingBufferIndex(currentSample, -graphDataPoints + i);
-      char val[16];
-      snprintf(val, sizeof(val), "%.2f", (currentSample > 0) ? (voltageData[index].voltage[ch] / VOLTAGE_SCALE) : 0.0);
-      strcat(json, val);
-      if (i < graphDataPoints - 1) strcat(json, ",");
+      float v = (currentSample > 0) ? (voltageData[index].voltage[ch] / VOLTAGE_SCALE) : 0.0;
+      offset += snprintf(json + offset, sizeof(json) - offset, "%.2f%s",
+                          v, (i < graphDataPoints - 1) ? "," : "");
     }
-    strcat(json, "]");
-    if (ch < 3) strcat(json, ",");
+    offset += snprintf(json + offset, sizeof(json) - offset, "]%s", (ch < 3) ? "," : "");
   }
-  strcat(json, "]");
+  if (offset < (int)sizeof(json)) {
+    snprintf(json + offset, sizeof(json) - offset, "");
+  }
+  if (offset >= (int)sizeof(json)) {
+    offset = sizeof(json) - 1; // snprintfの戻り値クランプ（バッファ超過時の安全策）
+  }
+
   server.send(200, "application/json", json);
 }
 
-// CSVエンドポイント（チャンク転送）
+// CSVエンドポイント（バッファに溜めてまとめて送信）
 void handleCsv() {
   server.sendHeader("Content-Type", "text/csv");
   server.send(200);
   WiFiClient client = server.client();
-  client.print("Timestamp,V1,V2,V3,V4\n");
+
+  static char buf[1024];
+  int offset = 0;
+  const int flushThreshold = sizeof(buf) - 128; // 1行分（最大128バイト想定）の余裕を残す
+
+  offset += snprintf(buf + offset, sizeof(buf) - offset, "Timestamp,V1,V2,V3,V4\n");
+
   for (int i = 0; i < totalSamples; i++) {
-    char row[128];
-    snprintf(row, sizeof(row), "%lld,%.2f,%.2f,%.2f,%.2f\n",
-             (long long)voltageData[i].timestamp,
-             voltageData[i].voltage[0] / VOLTAGE_SCALE,
-             voltageData[i].voltage[1] / VOLTAGE_SCALE,
-             voltageData[i].voltage[2] / VOLTAGE_SCALE,
-             voltageData[i].voltage[3] / VOLTAGE_SCALE);
-    client.print(row);
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                        "%lld,%.2f,%.2f,%.2f,%.2f\n",
+                        (long long)voltageData[i].timestamp,
+                        voltageData[i].voltage[0] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[1] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[2] / VOLTAGE_SCALE,
+                        voltageData[i].voltage[3] / VOLTAGE_SCALE);
+    if (offset >= flushThreshold) {
+      client.write((const uint8_t*)buf, offset);
+      offset = 0;
+    }
   }
-  client.print("\n10min Averages\nTimestamp,V1,V2,V3,V4\n");
+  if (offset > 0) {
+    client.write((const uint8_t*)buf, offset);
+    offset = 0;
+  }
+
+  offset += snprintf(buf + offset, sizeof(buf) - offset, "\n10min Averages\nTimestamp,V1,V2,V3,V4\n");
+
   for (int i = 0; i < totalHours * 6; i++) {
-    char row[128];
-    snprintf(row, sizeof(row), "%lld,%.2f,%.2f,%.2f,%.2f\n",
-             (long long)avgVoltage[i].timestamp,
-             avgVoltage[i].voltage[0] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[1] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[2] / VOLTAGE_SCALE,
-             avgVoltage[i].voltage[3] / VOLTAGE_SCALE);
-    client.print(row);
+    offset += snprintf(buf + offset, sizeof(buf) - offset,
+                        "%lld,%.2f,%.2f,%.2f,%.2f\n",
+                        (long long)avgVoltage[i].timestamp,
+                        avgVoltage[i].voltage[0] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[1] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[2] / VOLTAGE_SCALE,
+                        avgVoltage[i].voltage[3] / VOLTAGE_SCALE);
+    if (offset >= flushThreshold) {
+      client.write((const uint8_t*)buf, offset);
+      offset = 0;
+    }
   }
+  if (offset > 0) {
+    client.write((const uint8_t*)buf, offset);
+  }
+
   client.stop();
 }
 
 // 時刻取得（エラーハンドリング付き）
 String getFormattedTime() {
-  time_t now;
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     return "時刻同期失敗";
