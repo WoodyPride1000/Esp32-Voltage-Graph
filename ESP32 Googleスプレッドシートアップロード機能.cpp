@@ -52,8 +52,8 @@ const char* pathCsv = "/csv";
 // 例: const char* GOOGLE_SHEET_API_URL = "https://script.google.com/macros/s/AKfycbzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/exec";
 const char* GOOGLE_SHEET_API_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL";
 const char* GOOGLE_SHEET_API_SECRET = "your_secret_key"; // 簡単な認証用。Apps Script側で確認します。
-// 認証はURLクエリではなくHTTPヘッダー(X-Api-Secret)で送る。
-// GASの doPost(e) 側では e.parameter ではなく、リクエストヘッダーを確認する実装に変更が必要。
+// GASの doPost(e) はカスタムHTTPヘッダーを読めないため、シークレットはURLクエリでも
+// ヘッダーでもなくJSONボディに含めて送る。GAS側は e.postData.contents をパースして検証する。
 
 // ADC設定
 const float VOLTAGE_DIVIDER_RATIO = (100.0 + 15.0) / 15.0;
@@ -431,9 +431,12 @@ bool doSendToGoogleSheet(const AvgData& data) {
   HTTPClient http;
   http.setTimeout(4000); // 4秒でタイムアウト。無応答時に無限に張り付かないための上限
 
-  char payload[256];
+  // GAS の doPost(e) はカスタムHTTPヘッダーを読めない（e.parameter と e.postData のみ）。
+  // そのためシークレットはヘッダーではなくJSONボディに含める。
+  char payload[320];
   snprintf(payload, sizeof(payload),
-           "{\"timestamp\":%lld,\"v1\":%.2f,\"v2\":%.2f,\"v3\":%.2f,\"v4\":%.2f}",
+           "{\"secret\":\"%s\",\"timestamp\":%lld,\"v1\":%.2f,\"v2\":%.2f,\"v3\":%.2f,\"v4\":%.2f}",
+           GOOGLE_SHEET_API_SECRET,
            (long long)data.timestamp,
            data.voltage[0] / VOLTAGE_SCALE,
            data.voltage[1] / VOLTAGE_SCALE,
@@ -445,7 +448,6 @@ bool doSendToGoogleSheet(const AvgData& data) {
     return false;
   }
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Api-Secret", GOOGLE_SHEET_API_SECRET); // シークレットはヘッダーで送る（URLクエリに含めない）
 
   if (DEBUG_ENABLED) Serial.printf("Google Sheetsへデータを送信中: %s\n", GOOGLE_SHEET_API_URL);
   if (DEBUG_ENABLED) Serial.printf("ペイロード: %s\n", payload);
