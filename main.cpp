@@ -14,7 +14,7 @@ const int redLED = 4;   // エラー（WiFi接続失敗など）用
 // サンプリングと平均化の設定
 const int sampleIntervalSec = 10;   // 10秒ごとにサンプリング
 const int averageIntervalMin = 10;  // 10分ごとの平均
-const int totalHours = 6;           // 6時間分のデータ（メモリ節約）
+const int totalHours = 12;          // 12時間分のデータ（READMEの記述に合わせる）
 const int samplesPerAvg = averageIntervalMin * 60 / sampleIntervalSec; // 60サンプル/10分
 const int totalSamples = totalHours * 60 * 60 / sampleIntervalSec;     // 2160サンプル
 const int graphDataPoints = 30;     // グラフに表示するデータ数
